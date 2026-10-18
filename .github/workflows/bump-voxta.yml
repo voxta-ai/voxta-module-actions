@@ -1,0 +1,123 @@
+# Moves every module in the repository to a newer Voxta.Sdk.Modules without checking it out: the package version, the
+# module.json voxta range, packages.lock.json, and optionally the module's own version. Builds it, then opens a pull
+# request; merge it and tag to release. The caller grants contents: write and pull-requests: write, and enables
+# Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests".
+name: bump voxta
+
+on:
+  workflow_call:
+    inputs:
+      sdk:
+        description: Voxta.Sdk.Modules version, e.g. 1.14.0
+        type: string
+        required: true
+      voxta:
+        description: module.json voxta range (empty = ">=" + that version)
+        type: string
+        default: ''
+      bump:
+        description: Module version, patch, minor, major or none
+        type: string
+        default: patch
+
+env:
+  DOTNET_NOLOGO: true
+
+jobs:
+  # Restoring and building runs the packages' code: no write token here.
+  bump:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+
+      - name: Bump
+        env:
+          SDK: ${{ inputs.sdk }}
+          VOXTA: ${{ inputs.voxta }}
+          BUMP: ${{ inputs.bump }}
+        run: |
+          semver='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+          if [[ ! "$SDK" =~ $semver ]]; then echo "::error::\"$SDK\" is not a version."; exit 1; fi
+          if [[ ! "$BUMP" =~ ^(patch|minor|major|none)$ ]]; then echo "::error::bump is patch, minor, major or none."; exit 1; fi
+          range="${VOXTA:->=$SDK}"
+          comparator='(>=|>|<=|<|=)? *[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?'
+          valid="^ *$comparator( *, *$comparator)* *$"
+          if [[ ! "$range" =~ $valid ]]; then echo "::error::\"$range\" is not a Voxta range."; exit 1; fi
+
+          git ls-files '*.csproj' | while IFS= read -r project; do
+            sed -i -E "s#(<PackageReference Include=\"Voxta\.Sdk\.Modules\" Version=\")[^\"]*#\1$SDK#" "$project"
+          done
+          git ls-files '*module.json' | grep -E '(^|/)module\.json$' | while IFS= read -r manifest; do
+            sed -i -E "s#(\"voxta\" *: *\")[^\"]*#\1$range#" "$manifest"
+            if [[ "$BUMP" != none ]]; then
+              IFS=. read -r major minor patch <<< "$(jq -r .version "$manifest" | sed 's/-.*//')"
+              case "$BUMP" in
+                major) next="$((major + 1)).0.0" ;;
+                minor) next="$major.$((minor + 1)).0" ;;
+                *) next="$major.$minor.$((patch + 1))" ;;
+              esac
+              sed -i -E "0,/(\"version\" *: *\")[^\"]*/s##\1$next#" "$manifest"
+            fi
+            echo "$manifest: $(jq -c '{version, voxta}' "$manifest")"
+          done
+
+          # CI restores are locked (Directory.Build.props); this one writes the new lock files.
+          dotnet restore --force-evaluate -p:RestoreLockedMode=false
+
+      - name: Build
+        run: |
+          dotnet build -c Release
+          git ls-files '*module.json' | grep -E '(^|/)module\.json$' | while IFS= read -r manifest; do
+            dotnet publish "$(dirname "$manifest")" -c Release -p:VoxtaModulePack="$RUNNER_TEMP/dist/$(basename "$(dirname "$manifest")")"
+          done
+
+      - name: Diff
+        run: |
+          git add -N -- '*packages.lock.json'
+          git diff --binary -- '*.csproj' '*module.json' '*packages.lock.json' > "$RUNNER_TEMP/bump.patch"
+          if [[ ! -s "$RUNNER_TEMP/bump.patch" ]]; then echo "::error::Nothing to bump: already on $SDK."; exit 1; fi
+          git diff --stat -- '*.csproj' '*module.json' '*packages.lock.json'
+        env:
+          SDK: ${{ inputs.sdk }}
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bump
+          path: ${{ runner.temp }}/bump.patch
+
+  # Applies the reviewed diff only: runs no package code.
+  pull-request:
+    needs: bump
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bump
+          path: ${{ runner.temp }}
+
+      - name: Open the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SDK: ${{ inputs.sdk }}
+        run: |
+          branch="bump-voxta-$SDK-$GITHUB_RUN_ID"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git apply --index "$RUNNER_TEMP/bump.patch"
+          git commit -m "Voxta.Sdk.Modules $SDK"
+          git push origin "$branch"
+          gh pr create --title "Voxta.Sdk.Modules $SDK" --body "Bumped by the bump voxta workflow (run $GITHUB_RUN_ID), built and packed there. Merge, then tag the new version to release."

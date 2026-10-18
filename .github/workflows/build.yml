@@ -1,0 +1,63 @@
+# Builds and packs every module in the repository, as release.yml would, on pushes and pull requests. Restores are
+# locked (Directory.Build.props), so a package change without its packages.lock.json fails.
+name: build
+
+on:
+  workflow_call:
+
+env:
+  DOTNET_NOLOGO: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+
+      # A copy still named MyModule collides with every other copy in Voxta. The template repository itself is exempt.
+      - name: Check the template was renamed
+        if: ${{ !github.event.repository.is_template }}
+        run: |
+          if git grep -n MyModule -- ':!README.md' ':!.github' ':!.template.config'; then
+            echo "::error::Replace MyModule in the folder, project, solution, namespaces, ServiceName and module.json."
+            exit 1
+          fi
+
+      - name: Pack each module
+        run: |
+          git ls-files '*module.json' | grep -E '(^|/)module\.json$' | while IFS= read -r manifest; do
+            project="$(dirname "$manifest")"
+            out="$PWD/dist/$(basename "$project")"
+            if ! git ls-files --error-unmatch "$project/packages.lock.json" > /dev/null 2>&1; then
+              echo "::error::Commit $project/packages.lock.json: without it, a locked restore pins nothing."
+              exit 1
+            fi
+            dotnet publish "$project" -c Release -p:VoxtaModulePack="$out"
+            if [[ ! -f "$out/voxta-module.json" ]]; then
+              echo "::error::VoxtaModulePack produced nothing for $project. It needs Voxta.Sdk.Modules 1.13.0 or later."
+              exit 1
+            fi
+            # Voxta Cloud refuses bigger zips: download CUDA and other large dependencies at runtime.
+            for zip in "$out"/*.zip; do
+              if [[ $(stat -c %s "$zip") -gt $((32 * 1024 * 1024)) ]]; then
+                echo "::error::$(basename "$zip") is over 32 MB. Download large dependencies at runtime instead of bundling them."
+                exit 1
+              fi
+            done
+          done
+
+      - run: dotnet build -c Release
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: modules
+          path: dist/
+          if-no-files-found: error

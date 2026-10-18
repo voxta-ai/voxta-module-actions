@@ -1,0 +1,127 @@
+# Changes a published release without rebuilding it: caps its Voxta range when a later Voxta breaks it, or yanks it.
+# Voxta reads the release's voxta-module.json, so servers see the change on their next refresh; with `publish`, Voxta's
+# module source follows too. The caller grants contents: write and id-token: write.
+name: edit release
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag, e.g. v0.1.0
+        type: string
+        required: true
+      voxta:
+        description: New Voxta range, e.g. ">=1.13.0, <1.15.0" (empty keeps it)
+        type: string
+        default: ''
+      yanked:
+        description: unchanged, yes or no
+        type: string
+        default: unchanged
+      publish:
+        type: boolean
+        default: false
+      api-url:
+        type: string
+        default: https://api.voxta.ai
+
+env:
+  TOOL_VERSION: 1.13.0-alpha.6
+  DOTNET_NOLOGO: true
+
+jobs:
+  edit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      prerelease: ${{ steps.edit.outputs.prerelease }}
+    steps:
+      - name: Edit voxta-module.json
+        id: edit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          VOXTA: ${{ inputs.voxta }}
+          YANKED: ${{ inputs.yanked }}
+        run: |
+          comparator='(>=|>|<=|<|=)? *[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?'
+          range="^ *$comparator( *, *$comparator)* *$"
+          if [[ -n "$VOXTA" && ! "$VOXTA" =~ $range ]]; then
+            echo "::error::\"$VOXTA\" is not a Voxta range, e.g. \">=1.13.0, <1.15.0\"."
+            exit 1
+          fi
+          if [[ ! "$YANKED" =~ ^(unchanged|yes|no)$ ]]; then echo "::error::yanked is unchanged, yes or no."; exit 1; fi
+          gh release download "$TAG" --pattern voxta-module.json --dir in
+          mkdir -p out/dist
+          jq --arg voxta "$VOXTA" --arg yanked "$YANKED" '
+            (if $voxta != "" then .module.voxta = $voxta else . end)
+            | (if $yanked == "yes" then .yanked = true elif $yanked == "no" then .yanked = false else . end)
+          ' in/voxta-module.json > out/dist/voxta-module.json
+          cat out/dist/voxta-module.json
+          gh release upload "$TAG" out/dist/voxta-module.json --clobber
+          gh release download "$TAG" --pattern '*.zip' --dir out/dist
+          gh release view "$TAG" --json isPrerelease --jq 'if .isPrerelease then "prerelease=--prerelease" else "prerelease=" end' >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ inputs.publish }}
+        with:
+          name: release
+          path: out
+
+  # Loads the module to read its Add Modules entries, with no write token around.
+  prepare:
+    needs: edit
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: out
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Read its Add Modules entries
+        run: |
+          dotnet tool install --tool-path "$RUNNER_TEMP/tool" Voxta.ModulePublish --version "$TOOL_VERSION"
+          "$RUNNER_TEMP/tool/voxta-modulepublish" prepare --out out/listing out/dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: listing
+          path: out/listing
+
+  publish:
+    needs: [edit, prepare]
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: out
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: listing
+          path: out/listing
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+
+      # The zips are unchanged: only the range, the yank and the pre-release flag follow.
+      - name: Publish to Voxta
+        env:
+          VOXTA_API: ${{ inputs.api-url }}
+          PRERELEASE: ${{ needs.edit.outputs.prerelease }}
+        run: |
+          dotnet tool install --tool-path "$RUNNER_TEMP/tool" Voxta.ModulePublish --version "$TOOL_VERSION"
+          "$RUNNER_TEMP/tool/voxta-modulepublish" publish --api "$VOXTA_API" $PRERELEASE --listing out/listing out/dist

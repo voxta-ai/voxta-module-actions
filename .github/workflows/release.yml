@@ -1,0 +1,147 @@
+# Builds the module a tag names (v0.1.0, or <module id>/v0.1.0 in a repository with several), creates its GitHub
+# release, and with `publish` lists it in Voxta's module source. A version with a suffix (v0.2.0-beta.1) is a
+# pre-release. The caller grants contents: write, id-token: write and attestations: write.
+#
+# The build job runs the module's and its dependencies' code and holds no write token; the release job holds them and
+# runs none of it. Voxta Cloud accepts this workflow only from a v* tag or main of this repository.
+name: release
+
+on:
+  workflow_call:
+    inputs:
+      publish:
+        description: List the release in Voxta's module source (the repository must be trusted there).
+        type: boolean
+        default: false
+      api-url:
+        description: Voxta Cloud
+        type: string
+        default: https://api.voxta.ai
+
+env:
+  # Voxta.ModulePublish: reads a module the way Voxta does. Raised with each Voxta release.
+  TOOL_VERSION: 1.13.0-alpha.6
+  DOTNET_NOLOGO: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      prerelease: ${{ steps.module.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+
+      # A copy still named MyModule collides with every other copy in Voxta.
+      - name: Check the template was renamed
+        if: ${{ !github.event.repository.is_template }}
+        run: |
+          if git grep -n MyModule -- ':!README.md' ':!.github' ':!.template.config'; then
+            echo "::error::Replace MyModule in the folder, project, solution, namespaces, ServiceName and module.json."
+            exit 1
+          fi
+
+      - name: Find the module the tag names
+        id: module
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if [[ "$tag" == */v* ]]; then id="${tag%/v*}"; version="${tag##*/v}"; else id=""; version="${tag#v}"; fi
+          found=()
+          while IFS= read -r manifest; do
+            if [[ -z "$id" || "$(jq -r .id "$manifest")" == "$id" ]]; then found+=("$manifest"); fi
+          done < <(git ls-files '*module.json' | grep -E '(^|/)module\.json$')
+          if [[ ${#found[@]} -ne 1 ]]; then
+            echo "::error::${#found[@]} modules match $tag. With several modules, tag <module id>/v<version>."
+            exit 1
+          fi
+          manifest="${found[0]}"
+          if [[ "$(jq -r .version "$manifest")" != "$version" ]]; then
+            echo "::error::$manifest's version is not $version."
+            exit 1
+          fi
+          project="$(dirname "$manifest")"
+          if ! git ls-files --error-unmatch "$project/packages.lock.json" > /dev/null 2>&1; then
+            echo "::error::Commit $project/packages.lock.json: without it, a locked restore pins nothing."
+            exit 1
+          fi
+          echo "project=$project" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == *-* ]]; then echo "prerelease=--prerelease" >> "$GITHUB_OUTPUT"; fi
+
+      # Restores are locked (Directory.Build.props).
+      - name: Pack
+        env:
+          PROJECT: ${{ steps.module.outputs.project }}
+        run: |
+          dotnet publish "$PROJECT" -c Release -p:VoxtaModulePack="$PWD/out/dist"
+          if [[ ! -f out/dist/voxta-module.json ]]; then
+            echo "::error::VoxtaModulePack produced nothing. It needs Voxta.Sdk.Modules 1.13.0 or later."
+            exit 1
+          fi
+
+      # Loads the module to read its Add Modules entries, here where it can do no harm.
+      - name: Read its Add Modules entries
+        if: ${{ inputs.publish }}
+        run: |
+          dotnet tool install --tool-path "$RUNNER_TEMP/tool" Voxta.ModulePublish --version "$TOOL_VERSION"
+          "$RUNNER_TEMP/tool/voxta-modulepublish" prepare --out out/listing out/dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: module
+          path: out
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: module
+          path: out
+
+      # Signed proof that this workflow built the zip from this commit: gh attestation verify <zip> --repo <owner/repo>.
+      # GitHub attests private repositories only on Enterprise Cloud.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        if: ${{ !github.event.repository.private }}
+        with:
+          subject-path: out/dist/*.zip
+
+      # Re-running after a failed publish keeps the release already created.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            echo "$GITHUB_REF_NAME is already released."
+          else
+            gh release create "$GITHUB_REF_NAME" out/dist/* --verify-tag --generate-notes $PRERELEASE
+          fi
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        if: ${{ inputs.publish }}
+        with:
+          dotnet-version: 10.0.x
+
+      # This job's OIDC token tells Voxta Cloud the repository, commit, tag and workflow behind these files.
+      - name: Publish to Voxta
+        if: ${{ inputs.publish }}
+        env:
+          VOXTA_API: ${{ inputs.api-url }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+        run: |
+          dotnet tool install --tool-path "$RUNNER_TEMP/tool" Voxta.ModulePublish --version "$TOOL_VERSION"
+          "$RUNNER_TEMP/tool/voxta-modulepublish" publish --api "$VOXTA_API" $PRERELEASE --listing out/listing out/dist
