@@ -48,7 +48,7 @@ jobs:
           ref: ${{ inputs.tag }}
           persist-credentials: false
 
-      # The Voxta.ModulePublish matching the SDK the release was built with, as release.yml picked it.
+      # The Voxta.ModulePublish matching the SDK the tag locks, as release.yml picks it without tool-version.
       - name: Find its Voxta.Sdk.Modules
         id: tool
         if: ${{ inputs.publish }}
@@ -56,19 +56,23 @@ jobs:
           TAG: ${{ inputs.tag }}
           TOOL_VERSION: ${{ inputs.tool-version }}
         run: |
-          if [[ "$TAG" == */v* ]]; then id="${TAG%/v*}"; else id=""; fi
+          if [[ -n "$TOOL_VERSION" ]]; then echo "tool=$TOOL_VERSION" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if [[ "$TAG" == */v* ]]; then id="${TAG%/v*}"; version="${TAG##*/v}"; else id=""; version="${TAG#v}"; fi
           found=()
           while IFS= read -r manifest; do
-            if [[ -z "$id" || "$(jq -r .id "$manifest")" == "$id" ]]; then found+=("$manifest"); fi
+            if [[ ( -z "$id" || "$(jq -r .id "$manifest")" == "$id" ) && "$(jq -r .version "$manifest")" == "$version" ]]; then
+              found+=("$manifest")
+            fi
           done < <(git ls-files '*module.json' | grep -E '(^|/)module\.json$')
-          if [[ ${#found[@]} -ne 1 ]]; then echo "::error::${#found[@]} modules match $TAG."; exit 1; fi
+          if [[ ${#found[@]} -ne 1 ]]; then echo "::error::${#found[@]} modules match $TAG: pass tool-version."; exit 1; fi
           lock="$(dirname "${found[0]}")/packages.lock.json"
+          if [[ ! -f "$lock" ]]; then echo "::error::$TAG has no $lock: pass tool-version."; exit 1; fi
           sdk="$(jq -r '[.dependencies[]["Voxta.Sdk.Modules"].resolved // empty] | unique | join(" ")' "$lock")"
-          if [[ -z "$TOOL_VERSION" && ( -z "$sdk" || "$sdk" == *" "* ) ]]; then
-            echo "::error::$lock resolves no single Voxta.Sdk.Modules version."
+          if [[ -z "$sdk" || "$sdk" == *" "* ]]; then
+            echo "::error::$lock resolves no single Voxta.Sdk.Modules version: pass tool-version."
             exit 1
           fi
-          echo "tool=${TOOL_VERSION:-$sdk}" >> "$GITHUB_OUTPUT"
+          echo "tool=$sdk" >> "$GITHUB_OUTPUT"
 
       - name: Edit voxta-module.json
         id: edit

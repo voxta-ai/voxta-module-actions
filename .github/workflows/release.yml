@@ -79,7 +79,7 @@ jobs:
             exit 1
           fi
           sdk="$(jq -r '[.dependencies[]["Voxta.Sdk.Modules"].resolved // empty] | unique | join(" ")' "$project/packages.lock.json")"
-          if [[ -z "$sdk" || "$sdk" == *" "* ]]; then
+          if [[ -z "$TOOL_VERSION" && ( -z "$sdk" || "$sdk" == *" "* ) ]]; then
             echo "::error::$project/packages.lock.json resolves no single Voxta.Sdk.Modules version."
             exit 1
           fi
