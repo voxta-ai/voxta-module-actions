@@ -17,10 +17,12 @@ on:
         description: Voxta Cloud
         type: string
         default: https://api.voxta.ai
+      tool-version:
+        description: Voxta.ModulePublish version (empty = the module's Voxta.Sdk.Modules, from its packages.lock.json)
+        type: string
+        default: ''
 
 env:
-  # Voxta.ModulePublish: reads a module the way Voxta does. Raised with each Voxta release.
-  TOOL_VERSION: 1.13.0-alpha.6
   DOTNET_NOLOGO: true
 
 jobs:
@@ -30,6 +32,7 @@ jobs:
       contents: read
     outputs:
       prerelease: ${{ steps.module.outputs.prerelease }}
+      tool: ${{ steps.module.outputs.tool }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -48,8 +51,12 @@ jobs:
             exit 1
           fi
 
+      # Voxta.ModulePublish reads a module the way Voxta does: the version matching the module's SDK, so a newer Voxta
+      # breaks no module still on an older one.
       - name: Find the module the tag names
         id: module
+        env:
+          TOOL_VERSION: ${{ inputs.tool-version }}
         run: |
           tag="$GITHUB_REF_NAME"
           if [[ "$tag" == */v* ]]; then id="${tag%/v*}"; version="${tag##*/v}"; else id=""; version="${tag#v}"; fi
@@ -71,7 +78,13 @@ jobs:
             echo "::error::Commit $project/packages.lock.json: without it, a locked restore pins nothing."
             exit 1
           fi
+          sdk="$(jq -r '[.dependencies[]["Voxta.Sdk.Modules"].resolved // empty] | unique | join(" ")' "$project/packages.lock.json")"
+          if [[ -z "$sdk" || "$sdk" == *" "* ]]; then
+            echo "::error::$project/packages.lock.json resolves no single Voxta.Sdk.Modules version."
+            exit 1
+          fi
           echo "project=$project" >> "$GITHUB_OUTPUT"
+          echo "tool=${TOOL_VERSION:-$sdk}" >> "$GITHUB_OUTPUT"
           if [[ "$version" == *-* ]]; then echo "prerelease=--prerelease" >> "$GITHUB_OUTPUT"; fi
 
       # Restores are locked (Directory.Build.props).
@@ -88,6 +101,8 @@ jobs:
       # Loads the module to read its Add Modules entries, here where it can do no harm.
       - name: Read its Add Modules entries
         if: ${{ inputs.publish }}
+        env:
+          TOOL_VERSION: ${{ steps.module.outputs.tool }}
         run: |
           dotnet tool install --tool-path "$RUNNER_TEMP/tool" Voxta.ModulePublish --version "$TOOL_VERSION"
           "$RUNNER_TEMP/tool/voxta-modulepublish" prepare --out out/listing out/dist
@@ -142,6 +157,7 @@ jobs:
         env:
           VOXTA_API: ${{ inputs.api-url }}
           PRERELEASE: ${{ needs.build.outputs.prerelease }}
+          TOOL_VERSION: ${{ needs.build.outputs.tool }}
         run: |
           dotnet tool install --tool-path "$RUNNER_TEMP/tool" Voxta.ModulePublish --version "$TOOL_VERSION"
           "$RUNNER_TEMP/tool/voxta-modulepublish" publish --api "$VOXTA_API" $PRERELEASE --listing out/listing out/dist

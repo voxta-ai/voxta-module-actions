@@ -28,6 +28,10 @@ jobs:
 
 Reference them by a `v*` tag of this repository: Voxta Cloud accepts publishes only from those (or `main`).
 
+`release.yml` and `edit-release.yml` read the module with the `Voxta.ModulePublish` version that matches the
+`Voxta.Sdk.Modules` version in its `packages.lock.json`. A module therefore keeps releasing against its own Voxta
+version until `bump-voxta.yml` moves it to a newer one. Pass `tool-version` to override this.
+
 ## Publishing to Voxta's module source
 
 Voxta lists a module in its own source when Voxta trusts the repository it comes from (portal: **Admin → Module
